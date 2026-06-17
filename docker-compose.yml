@@ -1,0 +1,231 @@
+
+
+name: airflow-course-stage-c
+
+x-airflow-common: &airflow-common
+  # Main Airflow runtime (webserver/scheduler/worker/triggerer).
+  # Needed to orchestrate all ETL DAGs in the course.
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.9.3}
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
+    _PIP_ADDITIONAL_REQUIREMENTS: "pandas pydantic openpyxl pymongo minio boto3 clickhouse-driver clickhouse-connect python-aqi reverse_geocoder"
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-../airflow}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-../airflow}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-../airflow}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-../airflow}/plugins:/opt/airflow/plugins
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    clickhouse:
+      condition: service_healthy
+
+services:
+  postgres:
+    # Metadata DB for Airflow and training raw/dds layers.
+    
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    volumes:
+      - stage-c-postgres-db:/var/lib/postgresql/data
+    restart: always
+
+  redis:
+    # Celery broker for task queue between scheduler and workers.
+    # Required because we use CeleryExecutor.
+    image: redis:7
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    restart: always
+
+  mongodb:
+    # Document source storage to model JSON/event ingestion.
+    image: mongo:7
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: airflow
+      MONGO_INITDB_ROOT_PASSWORD: airflow
+      MONGO_INITDB_DATABASE: source_db
+    ports:
+      - "${MONGO_HOST_PORT:-27017}:27017"
+    volumes:
+      - stage-c-mongo-data:/data/db
+    restart: always
+
+  clickhouse:
+    # Analytical DB for marts and fast aggregations.
+    image: clickhouse/clickhouse-server:26.3.9.8
+    environment:
+      CLICKHOUSE_USER: airflow
+      CLICKHOUSE_PASSWORD: airflow
+      CLICKHOUSE_DB: airflow
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
+    volumes:
+      - stage-c-clickhouse-data:/var/lib/clickhouse
+      - stage-c-clickhouse-logs:/var/log/clickhouse-server
+      - ../airflow/clickhouse-config.xml:/etc/clickhouse-server/config.d/users.xml
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - default
+      - metabase-network
+    restart: always
+
+  warehouse-postgres:
+    # Dedicated warehouse storage for raw/dds layers.
+    # Isolated from Airflow metadata Postgres to mirror real architecture.
+    image: postgres:13
+    environment:
+      POSTGRES_USER: warehouse
+      POSTGRES_PASSWORD: warehouse
+      POSTGRES_DB: warehouse
+    ports:
+      - "${WAREHOUSE_POSTGRES_HOST_PORT:-55432}:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "warehouse"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    volumes:
+      - stage-c-warehouse-postgres-db:/var/lib/postgresql/data
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    user: "0:0"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /sources/logs /sources/dags /sources/plugins
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins}
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+      _PIP_ADDITIONAL_REQUIREMENTS: ""
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-../airflow}:/sources
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "${AIRFLOW_UI_PORT:-8080}:8080"
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
+
+  # Metabase
+  metabase:
+    image: metabase/metabase:v0.61.3.3  
+    container_name: metabase
+    ports:
+      - "3000:3000"
+    environment:
+      - MB_DB_TYPE=postgres
+      - MB_DB_DBNAME=metabase
+      - MB_DB_PORT=5432
+      - MB_DB_HOST=metabase-postgres
+      - MB_DB_USER=metabase
+      - MB_DB_PASS=metabase
+    volumes:
+      - stage-c-metabase-data:/metabase-data
+    networks:
+      - metabase-network
+    depends_on:
+      - metabase-postgres
+      - clickhouse
+    restart: unless-stopped
+
+  # PostgreSQL для хранения метаданных Metabase
+  metabase-postgres:
+    image: postgres:15
+    container_name: metabase-postgres
+    environment:
+      - POSTGRES_DB=metabase
+      - POSTGRES_USER=metabase
+      - POSTGRES_PASSWORD=metabase
+    volumes:
+      - stage-c-metabase-postgres-data:/var/lib/postgresql/data
+    networks:
+      - metabase-network
+    restart: unless-stopped
+
+volumes:
+  stage-c-postgres-db:
+  stage-c-mongo-data:
+  stage-c-clickhouse-data:
+  stage-c-clickhouse-logs:
+  stage-c-warehouse-postgres-db:
+  stage-c-metabase-data:
+  stage-c-metabase-postgres-data:
+
+networks:
+  metabase-network:
+    driver: bridge
