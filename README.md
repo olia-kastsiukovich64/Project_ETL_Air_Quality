@@ -48,6 +48,7 @@ ____
 ____
 
 ## **Архитектура**
+<img width="2816" height="1536" alt="Gemini_Generated_Image_jrw0gejrw0gejrw0 (1)" src="https://github.com/user-attachments/assets/f1c8eb45-761c-474b-9f40-a9295f6e166f" />
 
 Данные проходят последовательно через несколько слоёв хранения:
 
