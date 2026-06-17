@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 import logging
 from pymongo import MongoClient
 
+from airflow.datasets import Dataset
+
 from airflow.decorators import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.models import Variable
@@ -10,17 +12,22 @@ from airflow.operators.python import get_current_context
 
 logger = logging.getLogger(__name__)
 
+raw_sensors = Dataset("postgres:/raw_sensors_data")
+
+from utils.tg_callbacks import on_failure_tg 
 
 @dag(
     dag_id="Extract_from_Mongo_and_load_to_Postgress",
     start_date=datetime(2026, 6, 7),
     schedule="*/30 * * * *",
     catchup=True,
-    tags=["Project_ETL_Air_Quality"]
+    max_active_runs=1,
+    tags=["Project_ETL_Air_Quality"],
+    on_failure_callback=on_failure_tg
 )
 def extract_and_save_data():
 
-    @task
+    @task(on_failure_callback=on_failure_tg)
     def extract_and_prepare():
         try:
             mongo_uri = Variable.get("mongo_uri")
@@ -86,7 +93,8 @@ def extract_and_save_data():
         logger.info(f"Подготовлено записей для вставки: {len(prepared_rows)}")
         return prepared_rows
 
-    @task
+    # Публикуем Dataset-событие через outlets 
+    @task(outlets=[raw_sensors], on_failure_callback=on_failure_tg)
     def load_to_postgres(prepared_rows):
         if not prepared_rows:
             logger.info("Нет данных для вставки в Postgres")

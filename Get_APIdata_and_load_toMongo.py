@@ -8,6 +8,9 @@ from pymongo.errors import PyMongoError
 from airflow.decorators import dag, task
 from airflow.models import Variable
 
+from utils.tg_hook import TelegramAlertHook
+from utils.tg_callbacks import on_failure_tg 
+
 log = logging.getLogger(__name__)
 
 @dag(
@@ -15,17 +18,18 @@ log = logging.getLogger(__name__)
     start_date=datetime(2026, 6, 7),
     schedule="*/10 * * * *", # Запуск каждые 10 минут
     catchup=False,
-    tags=["Project_ETL_Air_Quality"]
+    tags=["Project_ETL_Air_Quality"],
+    on_failure_callback=on_failure_tg
 )
 
 def extract_and_save_data():
 
-    @task
+    @task(on_failure_callback=on_failure_tg)
     def fetch_api_data():
         DATA_API_URL = "https://api.purpleair.com/v1/sensors/{sensor_id}?fields=name,confidence,channel_flags,location_type,latitude,longitude,humidity,temperature,pressure,pm10.0,pm1.0,pm2.5,pm2.5_a,pm2.5_b,pm2.5_alt"
         HEADERS = {"X-API-Key": Variable.get("X-API-Key")}  
         #массив sensor_id по разным регионам, всего около 50
-        sensor_ids = [40237, 30759, 24519, 46683, 227901, 4105, 163445, 140476, 74251, 3151, 32981, 101511, 176857, 199317, 104076, 200747, 290700, 165897, 305846, 283278, 305642, 293859, 225711, 94253, 183603, 181333, 125083, 131429, 159361, 256435, 97711, 311457, 128039, 93747, 283510, 93783, 261179, 93801, 294545, 174393, 93999, 225873, 33495, 11178, 222719, 296551, 182167, 137722, 189007, 209723, 310811, 241901, 237041]
+        sensor_ids = [40237, 30759, 24519, 46683, 227901, 4105, 163445, 140476, 74251, 3151, 32981, 101511, 176857, 199317, 104076, 200747, 290700, 165897, 305846, 283278, 305642, 293859, 225711, 94253, 183603, 181333, 125083, 131429, 159361, 256435, 97711, 311457, 128039, 93747, 283510, 93783, 261179, 93801, 294545, 174393, 93999, 225873, 33495, 11178, 222719, 296551, 182167, 137722, 189007, 209723, 310811, 241901, 237041, 98497, 101968, 126963, 218487, 159809, 157147,  31375, 184741, 96401, 213701, 161407]
         results = []
         for sensor_id in sensor_ids:
             try:
@@ -55,7 +59,7 @@ def extract_and_save_data():
 
         return results
 
-    @task
+    @task(on_failure_callback=on_failure_tg)
     def save_data_to_Mongo(results):
 
         # Получаем URI подключения к Mongo из Variables Airflow

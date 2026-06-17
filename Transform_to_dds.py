@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import reverse_geocoder as rg
 
@@ -13,42 +13,26 @@ from airflow.operators.python import get_current_context
 
 logger = logging.getLogger(__name__)
 
-# Определяем Dataset для запуска DAG загрузки в Clickhouse 
-sensors_dataset = Dataset("postgres://raw_valid_sensors_data")
+# Определяем Datasets для запуска DAG и загрузки в Clickhouse 
+sensors_dataset = Dataset("postgres:/raw_valid_sensors_data")
+raw_sensors = Dataset("postgres:/raw_sensors_data")
 
-# Описание Pydantic модели
-class SensorModel(BaseModel):
-    record_id: int = Field(gt=0)
-    sensor_index: int = Field(gt=0)  # Индекс сенсора должен быть положительным
-    name: str = Field(max_length=64)
-    location_type: Literal[0, 1]  # 0 = Outside, 1 = Inside
-    latitude: float = Field(ge=-90, le=90)  # Широта должна быть в пределах -90 до 90
-    longitude: float = Field(ge=-180, le=180)  # Долгота должна быть в пределах -180 до 180
-    channel_flags: int = Field(ge=0)  
-    confidence: int = Field(ge=60, le=100)  # Уровень доверия к данным датчика в процентах от 60
-    humidity: int = Field(ge=0, le=100)  # Влажность в процентах от 0 до 100
-    temperature: int = Field(ge=-76, le=176)   # Диапазон при переводе в градусы -60 /+80 °C
-    pressure: float = Field(gt=0)  # Давление должно быть положительным
-    pm1_0: float = Field(ge=0)  # Концентрации частиц не могут быть отрицательными и содержат не более 2-ух знаков после запятой
-    pm2_5: float = Field(ge=0)
-    pm2_5_a: float = Field(ge=0)
-    pm2_5_b: float = Field(ge=0)
-    pm2_5_alt: float = Field(ge=0)
-    pm10_0: float = Field(ge=0)
-    time_stamp: datetime
+from utils.sensor_model import SensorModel
+from utils.tg_callbacks import on_failure_tg 
     
 
 @dag(
     dag_id="Extract_from_raw_and_load_to_dds",
     start_date=datetime(2026, 6, 10),
-    schedule="*/30 * * * *",  # Запуск каждые 30 минут
-    catchup=True, #нужен чтобы обработать пропущенные интервалы
+    schedule=[raw_sensors],  
+    catchup=False,
     max_active_runs=1,
-    tags=["Project_ETL_Air_Quality"]
+    tags=["Project_ETL_Air_Quality"],
+    on_failure_callback=on_failure_tg
 )
 def transform_data_and_load_to_dds():
 
-    @task
+    @task(inlets=[raw_sensors], on_failure_callback=on_failure_tg)
     def extract_and_validate_data():
         
         context = get_current_context()
@@ -57,10 +41,13 @@ def transform_data_and_load_to_dds():
 
         valid_sensor_data = []
 
+        ts_start = int(window_start.replace(tzinfo=timezone.utc).timestamp())
+        ts_end = int(window_end.replace(tzinfo=timezone.utc).timestamp())
+
         query = """
             SELECT *
             FROM raw.data_sensors
-            WHERE load_ts >= %(window_start)s AND load_ts <  %(window_end)s; 
+            WHERE time_stamp >= to_timestamp(%(window_start)s) AND time_stamp < to_timestamp(%(window_end)s); 
         """
         
         pg_hook = PostgresHook(postgres_conn_id="warehouse_postgres_conn")
@@ -68,7 +55,7 @@ def transform_data_and_load_to_dds():
 
         try:
             with conn.cursor() as cursor:
-                cursor.execute(query, {"window_start": window_start, "window_end": window_end})
+                cursor.execute(query, {"window_start": ts_start, "window_end": ts_end})
 
                 columns = [desc[0] for desc in cursor.description]
                 rows = cursor.fetchall()
@@ -95,7 +82,7 @@ def transform_data_and_load_to_dds():
         return valid_sensor_data 
 
     # Публикуем Dataset-событие через outlets 
-    @task(outlets=[sensors_dataset]) 
+    @task(outlets=[sensors_dataset], on_failure_callback=on_failure_tg) 
     def load_to_dds(valid_sensor_data):
         if not valid_sensor_data:
             logger.info("Нет данных для вставки в dds")
